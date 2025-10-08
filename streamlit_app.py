@@ -111,23 +111,35 @@ def classify_location(base_type, qty_required, max_tower_qty, max_pour_drum_qty)
 
 
 def format_output_df(df_priority):
-    """Formats a DataFrame for PDF export, applying sorting."""
+    """
+    Formats a DataFrame for PDF export. This version now correctly finds and
+    includes 'Unknown' locations (for 'To Be Produced' items).
+    """
     if df_priority.empty:
-        return pd.DataFrame(columns=["Location", "Location Description", "RM name", "RM code", "Batch number", "Available Quantity", "Quantity required", "Expiry Status", "Needs Highlighting", "Is Allergen", "Location Priority"])
+        return pd.DataFrame(columns=["Location", "Location Description", "RM name", "RM code", "Batch number",
+                                     "Available Quantity", "Quantity required", "Expiry Status", "Needs Highlighting",
+                                     "Is Allergen", "Location Priority", "Is To Be Produced"])
 
     output_columns = ["Location Type", "Location Description", "Description", "Component", "Batch Nr.1",
-                      "Available Quantity", "Quantity required", "Expiry Status", "Needs Highlighting", "Is Allergen", "Location Priority"]
+                      "Available Quantity", "Quantity required", "Expiry Status", "Needs Highlighting",
+                      "Is Allergen", "Location Priority", "Is To Be Produced"]
+
     df_final = df_priority[output_columns].copy()
     df_final.rename(columns={"Location Type": "Location", "Description": "RM name",
                     "Component": "RM code", "Batch Nr.1": "Batch number"}, inplace=True)
     df_final['RM name'] = df_final['RM name'].str[:20]
 
     formatted_rows = []
+    # 1. Process all the standard, known locations first
     for location in LOCATION_ORDER:
         subset = df_final[df_final["Location"] == location]
         if not subset.empty:
-            header_row = {"Location": location, "Location Description": "", "RM name": "", "RM code": "", "Batch number": "", "Available Quantity": "",
-                          "Quantity required": "", "Expiry Status": "", "Needs Highlighting": False, "Is Allergen": False, "Location Priority": 0}
+            header_row = {
+                "Location": location, "Location Description": "", "RM name": "", "RM code": "",
+                "Batch number": "", "Available Quantity": "", "Quantity required": "",
+                "Expiry Status": "", "Needs Highlighting": False, "Is Allergen": False,
+                "Location Priority": 0, "Is To Be Produced": False
+            }
             formatted_rows.append(header_row)
 
             if location in ["Tower", "Pour drum", "Powder"]:
@@ -141,6 +153,27 @@ def format_output_df(df_priority):
             for _, row in subset.iterrows():
                 formatted_rows.append(row.to_dict())
 
+    # --- FIXED LOGIC: After processing standard locations, check for 'Unknown' ---
+    unknown_subset = df_final[df_final["Location"] == "Unknown"]
+    if not unknown_subset.empty:
+        # Add a header for this special section
+        header_row = {
+            "Location": "To Be Produced", "Location Description": "", "RM name": "", "RM code": "",
+            "Batch number": "", "Available Quantity": "", "Quantity required": "",
+            "Expiry Status": "", "Needs Highlighting": False, "Is Allergen": False,
+            "Location Priority": 99, "Is To Be Produced": True
+        }
+        formatted_rows.append(header_row)
+
+        # Sort and add the 'Unknown' items
+        unknown_subset = unknown_subset.sort_values(
+            by=['RM name', 'Batch number'])
+        for _, row in unknown_subset.iterrows():
+            # Update the 'Location' field for better display
+            row_dict = row.to_dict()
+            row_dict['Location'] = 'To Be Produced'
+            formatted_rows.append(row_dict)
+
     if not formatted_rows:
         return pd.DataFrame(columns=df_final.columns)
 
@@ -150,7 +183,8 @@ def format_output_df(df_priority):
 
 def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
     """
-    Processes the production ticket using the new SubType for correct prioritization.
+    Processes the production ticket, now correctly handling blank/unknown locations
+    and applying the 'To Be Produced' logic.
     """
     debug_data = {}
 
@@ -164,6 +198,9 @@ def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
         float).sum()
     product_info["Raw Material Count"] = df["Component"].nunique()
 
+    # --- UPDATED: Keep all data initially, don't filter yet ---
+    df_processed = df.copy()
+
     pat = re.compile(r'([^()]+)(?:\s*\(([^)]+)\))?')
 
     def parse_ticket_location(full_loc):
@@ -172,69 +209,75 @@ def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
             return match.group(1).strip()
         return str(full_loc).strip()
 
-    df['Location Code'] = df['Location Description'].apply(
+    df_processed['Location Code'] = df_processed['Location Description'].apply(
         parse_ticket_location)
-    df_filtered = df[df['Location Code'].isin(location_map.index)].copy()
-    debug_data['1_filtered_ticket'] = df_filtered.copy()
 
-    df_filtered["Quantity required"] = pd.to_numeric(
-        df_filtered["Quantity required"], errors='coerce').fillna(0)
-    df_filtered["Available Quantity"] = pd.to_numeric(df_filtered["Available Quantity"].astype(
-        str).str.replace(',', '.'), errors='coerce').fillna(0)
-
-    # Map all new properties from the location map
-    df_filtered['Location SubType'] = df_filtered['Location Code'].map(
+    # Map properties, leaving unmapped locations as NaN for now
+    df_processed['Location SubType'] = df_processed['Location Code'].map(
         location_map['Location SubType'])
-    df_filtered['Location Type'] = df_filtered['Location Code'].map(
-        location_map['Location Type'])
-    df_filtered['Is Allergen'] = df_filtered['Location Code'].map(
+    df_processed['Is Allergen'] = df_processed['Location Code'].map(
         location_map['Is Allergen'])
 
-    # Refine the SubType based on quantity limits to create the final type for prioritization
+    # Fill NaN for unmapped locations with 'Unknown'
+    df_processed['Location SubType'].fillna('Unknown', inplace=True)
+    df_processed['Is Allergen'].fillna(False, inplace=True)
+
+    debug_data['1_mapped_ticket'] = df_processed.copy()  # New debug step
+
+    df_processed["Quantity required"] = pd.to_numeric(
+        df_processed["Quantity required"], errors='coerce').fillna(0)
+    df_processed["Available Quantity"] = pd.to_numeric(df_processed["Available Quantity"].astype(
+        str).str.replace(',', '.'), errors='coerce').fillna(0)
+
+    def map_subtype_to_main_type(subtype):
+        if 'Powder' in str(subtype):
+            return 'Powder'
+        return subtype
+    df_processed['Location Type'] = df_processed['Location SubType'].apply(
+        map_subtype_to_main_type)
+
     def refine_location_subtype(row):
         subtype = row['Location SubType']
         qty_required = row['Quantity required']
-
         if subtype == "Tower" and qty_required >= max_tower_qty:
             return "Tower overweight"
         if subtype == "Pour drum" and qty_required >= max_pour_drum_qty:
             return "Pour drum overweight"
         return subtype
-
-    df_filtered['Final SubType'] = df_filtered.apply(
+    df_processed['Final SubType'] = df_processed.apply(
         refine_location_subtype, axis=1)
 
-    df_filtered['DLUO_dt'] = pd.to_datetime(
-        df_filtered['DLUO'], format='%d%m%Y', errors='coerce')
+    df_processed['DLUO_dt'] = pd.to_datetime(
+        df_processed['DLUO'], format='%d%m%Y', errors='coerce')
     one_month_later = production_date + pd.DateOffset(months=1)
-    conditions = [df_filtered['DLUO_dt'] < production_date,
-                  (df_filtered['DLUO_dt'] >= production_date) & (df_filtered['DLUO_dt'] < one_month_later)]
-    df_filtered['Expiry Status'] = np.select(
+    conditions = [df_processed['DLUO_dt'] < production_date,
+                  (df_processed['DLUO_dt'] >= production_date) & (df_processed['DLUO_dt'] < one_month_later)]
+    df_processed['Expiry Status'] = np.select(
         conditions, ['Expired', 'Expiring Soon'], default='OK')
 
-    # --- UPDATED: Priority map uses the new Powder sub-types ---
     priority_map = {loc: i + 1 for i, loc in enumerate(LOCATION_ORDER)}
-    priority_map['Powder (PW)'] = 3.1  # Higher priority for PW
-    priority_map['Powder'] = 3.2       # Standard priority for (Powder)
-    priority_map['Tower overweight'] = 8
-    priority_map['Pour drum overweight'] = 8
+    priority_map.update({'Powder (PW)': 3.1, 'Powder': 3.2, 'Tower overweight': 8,
+                        'Pour drum overweight': 8, 'Unknown': 99})  # Add Unknown with lowest priority
 
-    # Use the FINAL SubType for priority calculation
-    df_filtered["Location Priority"] = df_filtered["Final SubType"].map(
+    df_processed["Location Priority"] = df_processed["Final SubType"].map(
         priority_map)
+    debug_data['2_classified_data'] = df_processed.copy()
 
-    debug_data['2_classified_data'] = df_filtered.copy()
-
-    df_filtered.sort_values(
+    df_processed.sort_values(
         by=["Component", "Location Priority", "Batch Nr.1"], inplace=True)
-    debug_data['3_sorted_by_priority'] = df_filtered.copy()
+    debug_data['3_sorted_by_priority'] = df_processed.copy()
 
-    # The rest of this function remains unchanged...
-    df_filtered['Rank'] = df_filtered.groupby('Component').cumcount() + 1
+    df_processed['Rank'] = df_processed.groupby('Component').cumcount() + 1
     all_priority_groups = []
-    for component_code, group in df_filtered.groupby("Component"):
-        required_qty, collected_qty = group["Quantity required"].iloc[0], 0
+    for component_code, group in df_processed.groupby("Component"):
         group_copy = group.copy()
+        required_qty = group_copy["Quantity required"].iloc[0]
+
+        # --- NEW: Logic for "To Be Produced" highlighting ---
+        group_copy['Is To Be Produced'] = False  # Default to False
+        # Check if the highest-ranked item (Rank 1) is an "Unknown" location
+        if not group_copy.empty and group_copy.iloc[0]['Location Priority'] == 99:
+            group_copy.loc[group_copy.index[0], 'Is To Be Produced'] = True
 
         group_copy['Cumulative Qty'] = group_copy['Available Quantity'].cumsum()
         first_pick_mask = group_copy['Cumulative Qty'] < required_qty
@@ -265,6 +308,11 @@ def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
     if not all_priority_groups:
         return product_info, {}, {}
     df_with_priorities = pd.concat(all_priority_groups)
+
+    # Final filter: now we remove any 'Unknown' location that ISN'T a 'To Be Produced' item
+    df_with_priorities = df_with_priorities[~((df_with_priorities['Location Priority'] == 99) & (
+        df_with_priorities['Is To Be Produced'] == False))]
+
     debug_data['4_final_assignments'] = df_with_priorities.copy()
 
     priority_dfs_raw = {p_level: df_with_priorities[df_with_priorities['Assigned Priority'] == p_level] for p_level in [
@@ -277,10 +325,12 @@ def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
 
 def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, content_to_include):
     """
-    Generates PDF(s) with updated Allergen highlighting (light blue) and smarter
-    color precedence for expiry warnings.
+    Generates PDF(s), now correctly including "To Be Produced" items even when
+    splitting files.
     """
     generated_files = []
+
+    ALLERGEN_COLOR = colors.lightblue
 
     for config in file_configs:
         file_num, total_files, locations_for_this_file = config[
@@ -310,8 +360,13 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
 
         for priority_name in content_to_include:
             if priority_name in priority_dfs:
-                df_output = priority_dfs[priority_name][priority_dfs[priority_name]['Location'].isin(
-                    locations_for_this_file)]
+                # --- FIXED LOGIC: Keep a row if its location is in the list OR if it's a "To Be Produced" item ---
+                df_to_filter = priority_dfs[priority_name]
+                df_output = df_to_filter[
+                    df_to_filter['Location'].isin(locations_for_this_file) |
+                    (df_to_filter['Location'] == 'To Be Produced')
+                ]
+
                 if not df_output.empty:
                     content_added_to_this_pdf = True
                     if not is_first_content_block:
@@ -328,7 +383,7 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
                     for _, row in df_output.iterrows():
                         if row['RM code'] == '':
                             table_data.append(list(row.drop(
-                                ['Expiry Status', 'Needs Highlighting', 'Is Allergen', 'Location Priority'])))
+                                ['Expiry Status', 'Needs Highlighting', 'Is Allergen', 'Is To Be Produced', 'Location Priority'])))
                             continue
                         barcode_cell = Paragraph(
                             str(row['RM code']), styles['Normal'])
@@ -353,19 +408,18 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
                                 original_row = df_output[df_output['Batch number'] == str(
                                     row_data[4].text)].iloc[0]
 
-                                # --- UPDATED: Highlighting logic with precedence ---
-                                # Start with allergen color
+                                if original_row['Is To Be Produced']:
+                                    dynamic_styles.append(
+                                        ('BACKGROUND', (0, i), (-1, i), colors.lightgreen))
                                 if original_row['Is Allergen']:
                                     dynamic_styles.append(
                                         ('BACKGROUND', (2, i), (2, i), ALLERGEN_COLOR))
-                                # Expiry warnings are more critical, so they will override the allergen color if applicable
                                 if original_row['Expiry Status'] == 'Expired':
                                     dynamic_styles.append(
                                         ('BACKGROUND', (2, i), (2, i), colors.lightcoral))
                                 elif original_row['Expiry Status'] == 'Expiring Soon':
                                     dynamic_styles.append(
                                         ('BACKGROUND', (2, i), (2, i), colors.moccasin))
-
                                 if original_row['Needs Highlighting']:
                                     dynamic_styles.append(
                                         ('BACKGROUND', (5, i), (6, i), colors.yellow))
@@ -469,10 +523,14 @@ if uploaded_file is not None and location_map_file is not None:
 
         if 'First Priority' in priority_dataframes and not priority_dataframes['First Priority'].empty:
             preview_df = priority_dataframes['First Priority']
+
+            # Define the columns we want to show the user in the preview
             columns_to_show = [
                 'Location', 'Location Description', 'RM name', 'RM code',
                 'Batch number', 'Available Quantity', 'Quantity required'
             ]
+
+            # Filter the DataFrame to only these columns for a clean preview
             st.dataframe(preview_df[columns_to_show])
 
             if is_valid_config and st.sidebar.button("Generate Full Picking PDF"):
@@ -500,29 +558,30 @@ if uploaded_file is not None and location_map_file is not None:
             st.warning(
                 "No valid first-priority items were found based on the provided files.")
 
-        # --- NEW: Debugging Section ---
-        # st.markdown("---")
-        # st.header("Debug Information (Intermediate Steps)")
+        '''# --- NEW: Debugging Section ---
+        st.markdown("---")
+        st.header("Debug Information (Intermediate Steps)")
 
-        # with st.expander("Step 1: Raw Data After Filtering"):
-        #     st.caption("This shows the rows from the production ticket that matched a valid location in your mapping file. Rows with (WIP) or (NC) are excluded.")
-        #     if '1_filtered_ticket' in debug_dfs and not debug_dfs['1_filtered_ticket'].empty:
-        #         st.dataframe(debug_dfs['1_filtered_ticket'])
+        with st.expander("Step 1: Raw Data After Filtering"):
+            st.caption(
+                "This shows the rows from the production ticket that matched a valid location in your mapping file. Rows with (WIP) or (NC) are excluded.")
+            if '1_filtered_ticket' in debug_dfs and not debug_dfs['1_filtered_ticket'].empty:
+                st.dataframe(debug_dfs['1_filtered_ticket'])
 
-        # with st.expander("Step 2: After Classification"):
-        #     st.caption("This is the MOST IMPORTANT step. Check the 'Location Type' and 'Location Priority' columns. A lower priority number is better. Ensure Powder/Allergen locations are correctly typed and prioritized.")
-        #     if '2_classified_data' in debug_dfs and not debug_dfs['2_classified_data'].empty:
-        #         st.dataframe(debug_dfs['2_classified_data'])
+        with st.expander("Step 2: After Classification"):
+            st.caption("This is the MOST IMPORTANT step. Check the 'Location Type' and 'Location Priority' columns. A lower priority number is better. Ensure Powder/Allergen locations are correctly typed and prioritized.")
+            if '2_classified_data' in debug_dfs and not debug_dfs['2_classified_data'].empty:
+                st.dataframe(debug_dfs['2_classified_data'])
 
-        # with st.expander("Step 3: After Sorting by Priority"):
-        #     st.caption("This shows the full list of all possible items, sorted by Component, then by the 'Location Priority'. The top items for each component will be picked first.")
-        #     if '3_sorted_by_priority' in debug_dfs and not debug_dfs['3_sorted_by_priority'].empty:
-        #         st.dataframe(debug_dfs['3_sorted_by_priority'])
+        with st.expander("Step 3: After Sorting by Priority"):
+            st.caption("This shows the full list of all possible items, sorted by Component, then by the 'Location Priority'. The top items for each component will be picked first.")
+            if '3_sorted_by_priority' in debug_dfs and not debug_dfs['3_sorted_by_priority'].empty:
+                st.dataframe(debug_dfs['3_sorted_by_priority'])
 
-        # with st.expander("Step 4: After Final Priority Assignment"):
-        #     st.caption("This is the final result before formatting. Check the 'Assigned Priority' column to see which items were selected for 'First Priority' based on the quantity needed.")
-        #     if '4_final_assignments' in debug_dfs and not debug_dfs['4_final_assignments'].empty:
-        #         st.dataframe(debug_dfs['4_final_assignments'])
+        with st.expander("Step 4: After Final Priority Assignment"):
+            st.caption("This is the final result before formatting. Check the 'Assigned Priority' column to see which items were selected for 'First Priority' based on the quantity needed.")
+            if '4_final_assignments' in debug_dfs and not debug_dfs['4_final_assignments'].empty:
+                st.dataframe(debug_dfs['4_final_assignments'])'''
 
     except Exception as e:
         st.error(f"An error occurred: {e}")
