@@ -113,16 +113,16 @@ def classify_location(base_type, qty_required, max_tower_qty, max_pour_drum_qty)
 def format_output_df(df_priority):
     """
     Formats a DataFrame for PDF export. This version now correctly finds and
-    includes 'Unknown' locations (for 'To Be Produced' items).
+    includes 'Unknown' locations (for 'To Be Prod.' items).
     """
     if df_priority.empty:
         return pd.DataFrame(columns=["Location", "Location Description", "RM name", "RM code", "Batch number",
                                      "Available Quantity", "Quantity required", "Expiry Status", "Needs Highlighting",
-                                     "Is Allergen", "Location Priority", "Is To Be Produced"])
+                                     "Is Allergen", "Location Priority", "To Be Prod."])
 
     output_columns = ["Location Type", "Location Description", "Description", "Component", "Batch Nr.1",
                       "Available Quantity", "Quantity required", "Expiry Status", "Needs Highlighting",
-                      "Is Allergen", "Location Priority", "Is To Be Produced"]
+                      "Is Allergen", "Location Priority", "To Be Prod."]
 
     df_final = df_priority[output_columns].copy()
     df_final.rename(columns={"Location Type": "Location", "Description": "RM name",
@@ -138,7 +138,7 @@ def format_output_df(df_priority):
                 "Location": location, "Location Description": "", "RM name": "", "RM code": "",
                 "Batch number": "", "Available Quantity": "", "Quantity required": "",
                 "Expiry Status": "", "Needs Highlighting": False, "Is Allergen": False,
-                "Location Priority": 0, "Is To Be Produced": False
+                "Location Priority": 0, "To Be Prod.": False
             }
             formatted_rows.append(header_row)
 
@@ -158,10 +158,10 @@ def format_output_df(df_priority):
     if not unknown_subset.empty:
         # Add a header for this special section
         header_row = {
-            "Location": "To Be Produced", "Location Description": "", "RM name": "", "RM code": "",
+            "Location": "To Be Prod.", "Location Description": "", "RM name": "", "RM code": "",
             "Batch number": "", "Available Quantity": "", "Quantity required": "",
             "Expiry Status": "", "Needs Highlighting": False, "Is Allergen": False,
-            "Location Priority": 99, "Is To Be Produced": True
+            "Location Priority": 99, "To Be Prod.": True
         }
         formatted_rows.append(header_row)
 
@@ -171,7 +171,7 @@ def format_output_df(df_priority):
         for _, row in unknown_subset.iterrows():
             # Update the 'Location' field for better display
             row_dict = row.to_dict()
-            row_dict['Location'] = 'To Be Produced'
+            row_dict['Location'] = 'To Be Prod.'
             formatted_rows.append(row_dict)
 
     if not formatted_rows:
@@ -182,23 +182,26 @@ def format_output_df(df_priority):
 
 
 def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
-    """
-    Processes the production ticket, now correctly handling blank/unknown locations
-    and applying the 'To Be Produced' logic.
-    """
+
     debug_data = {}
 
     first_row = df.iloc[0]
     production_date = pd.to_datetime(
         first_row["Current date marked the beginning"], format='%d%m%Y', errors='coerce')
-    product_info = {"Production Ticket Nr": first_row["Production Ticket Nr"], "Wording": first_row["Wording"], "Product Code": first_row["Product Code"],
-                    "Quantity Launched": df["Quantity launched Theoretical"].astype(float).max(), "Production Date": production_date.date()}
+    product_info = {
+        "Production Ticket Nr": first_row["Production Ticket Nr"],
+        "Batch Nr": first_row["Batch Nr"],
+        "Wording": first_row["Wording"],
+        "Product Code": first_row["Product Code"],
+        "Quantity Launched": df["Quantity launched Theoretical"].astype(float).max(),
+        "Production Date": production_date.date()
+    }
+
     unique_materials = df.drop_duplicates(subset=["Component", "Description"])
     product_info["Quantity Produced"] = unique_materials["Quantity required"].astype(
         float).sum()
     product_info["Raw Material Count"] = df["Component"].nunique()
 
-    # --- UPDATED: Keep all data initially, don't filter yet ---
     df_processed = df.copy()
 
     pat = re.compile(r'([^()]+)(?:\s*\(([^)]+)\))?')
@@ -273,11 +276,11 @@ def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
         group_copy = group.copy()
         required_qty = group_copy["Quantity required"].iloc[0]
 
-        # --- NEW: Logic for "To Be Produced" highlighting ---
-        group_copy['Is To Be Produced'] = False  # Default to False
+        # --- NEW: Logic for "To Be Prod." highlighting ---
+        group_copy['To Be Prod.'] = False  # Default to False
         # Check if the highest-ranked item (Rank 1) is an "Unknown" location
         if not group_copy.empty and group_copy.iloc[0]['Location Priority'] == 99:
-            group_copy.loc[group_copy.index[0], 'Is To Be Produced'] = True
+            group_copy.loc[group_copy.index[0], 'To Be Prod.'] = True
 
         group_copy['Cumulative Qty'] = group_copy['Available Quantity'].cumsum()
         first_pick_mask = group_copy['Cumulative Qty'] < required_qty
@@ -309,9 +312,9 @@ def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
         return product_info, {}, {}
     df_with_priorities = pd.concat(all_priority_groups)
 
-    # Final filter: now we remove any 'Unknown' location that ISN'T a 'To Be Produced' item
+    # Final filter: now we remove any 'Unknown' location that ISN'T a 'To Be Prod.' item
     df_with_priorities = df_with_priorities[~((df_with_priorities['Location Priority'] == 99) & (
-        df_with_priorities['Is To Be Produced'] == False))]
+        df_with_priorities['To Be Prod.'] == False))]
 
     debug_data['4_final_assignments'] = df_with_priorities.copy()
 
@@ -325,12 +328,17 @@ def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
 
 def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, content_to_include):
     """
-    Generates PDF(s), now correctly including "To Be Produced" items even when
-    splitting files.
+    Generates PDF(s) with the Color Code Legend and the corrected filtering logic
+    to ensure "To Be Produced" items are always included.
     """
     generated_files = []
 
+    # Define colors here for consistency
     ALLERGEN_COLOR = colors.lightblue
+    EXPIRED_COLOR = colors.lightcoral
+    EXPIRING_SOON_COLOR = colors.moccasin
+    MULTI_PICK_COLOR = colors.yellow
+    TO_BE_PRODUCED_COLOR = colors.lightgreen
 
     for config in file_configs:
         file_num, total_files, locations_for_this_file = config[
@@ -345,26 +353,69 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
         styles['Normal'].fontName = FONT_NORMAL
         styles['h1'].fontName = FONT_BOLD
 
-        elements, content_added_to_this_pdf, is_first_content_block = [], False, True
+        elements = []
 
+        # 1. Main Title
         title_text = f"Production Ticket Information - {product_info['Production Ticket Nr']}"
         if total_files > 1:
             title_text += f" ({file_num} / {total_files})"
         elements.append(Paragraph(title_text, styles['h1']))
+        elements.append(Spacer(1, 0.1*inch))
 
+        # 2. Left Column: Production Info Table
         info_copy = {k: v for k, v in product_info.items() if k !=
                      "Production Ticket Nr"}
-        elements.append(Table([[key, str(value)] for key, value in info_copy.items()], colWidths=[2*inch, 5*inch], style=[('ALIGN', (0, 0), (-1, -1), 'LEFT'), ('FONTNAME',
-                        (0, 0), (0, -1), FONT_BOLD), ('FONTNAME', (1, 0), (1, -1), FONT_NORMAL), ('BOTTOMPADDING', (0, 0), (-1, 0), 12), ('GRID', (0, 0), (-1, -1), 1, colors.black)]))
+        info_data = [[key, str(value)] for key, value in info_copy.items()]
+        info_table = Table(info_data, colWidths=[1.5*inch, 2.5*inch])
+        info_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), FONT_BOLD),
+            ('FONTNAME', (1, 0), (1, -1), FONT_NORMAL),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6)
+        ]))
+
+        # 3. Right Column: Color Code Legend Table
+        legend_data = [
+            ['Color', 'Meaning'],
+            ['', 'Allergen Material'],
+            ['', 'Expired Material'],
+            ['', 'Expires Within 1 Month'],
+            ['', 'Multi-location Pick'],
+            ['', 'To Be Produced / Located']
+        ]
+        legend_table = Table(legend_data, colWidths=[0.5*inch, 2.2*inch])
+        legend_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, 0), FONT_BOLD),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BACKGROUND', (0, 1), (0, 1), ALLERGEN_COLOR),
+            ('BACKGROUND', (0, 2), (0, 2), EXPIRED_COLOR),
+            ('BACKGROUND', (0, 3), (0, 3), EXPIRING_SOON_COLOR),
+            ('BACKGROUND', (0, 4), (0, 4), MULTI_PICK_COLOR),
+            ('BACKGROUND', (0, 5), (0, 5), TO_BE_PRODUCED_COLOR),
+        ]))
+
+        # 4. Combine Info and Legend into a single parent table
+        parent_table_data = [[info_table, legend_table]]
+        parent_table = Table(parent_table_data, colWidths=[
+                             4.2*inch, 2.9*inch], style=[('VALIGN', (0, 0), (-1, -1), 'TOP')])
+
+        elements.append(parent_table)
         elements.append(Spacer(1, 0.2*inch))
 
+        content_added_to_this_pdf, is_first_content_block = False, True
         for priority_name in content_to_include:
             if priority_name in priority_dfs:
                 # --- FIXED LOGIC: Keep a row if its location is in the list OR if it's a "To Be Produced" item ---
                 df_to_filter = priority_dfs[priority_name]
                 df_output = df_to_filter[
                     df_to_filter['Location'].isin(locations_for_this_file) |
-                    (df_to_filter['Location'] == 'To Be Produced')
+                    (df_to_filter['Location'] == 'To Be Prod.')
                 ]
 
                 if not df_output.empty:
@@ -383,7 +434,7 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
                     for _, row in df_output.iterrows():
                         if row['RM code'] == '':
                             table_data.append(list(row.drop(
-                                ['Expiry Status', 'Needs Highlighting', 'Is Allergen', 'Is To Be Produced', 'Location Priority'])))
+                                ['Expiry Status', 'Needs Highlighting', 'Is Allergen', 'To Be Prod.', 'Location Priority'])))
                             continue
                         barcode_cell = Paragraph(
                             str(row['RM code']), styles['Normal'])
@@ -407,22 +458,21 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
                             try:
                                 original_row = df_output[df_output['Batch number'] == str(
                                     row_data[4].text)].iloc[0]
-
-                                if original_row['Is To Be Produced']:
+                                if original_row['To Be Prod.']:
                                     dynamic_styles.append(
-                                        ('BACKGROUND', (0, i), (-1, i), colors.lightgreen))
+                                        ('BACKGROUND', (0, i), (-1, i), TO_BE_PRODUCED_COLOR))
                                 if original_row['Is Allergen']:
                                     dynamic_styles.append(
                                         ('BACKGROUND', (2, i), (2, i), ALLERGEN_COLOR))
                                 if original_row['Expiry Status'] == 'Expired':
                                     dynamic_styles.append(
-                                        ('BACKGROUND', (2, i), (2, i), colors.lightcoral))
+                                        ('BACKGROUND', (2, i), (2, i), EXPIRED_COLOR))
                                 elif original_row['Expiry Status'] == 'Expiring Soon':
                                     dynamic_styles.append(
-                                        ('BACKGROUND', (2, i), (2, i), colors.moccasin))
+                                        ('BACKGROUND', (2, i), (2, i), EXPIRING_SOON_COLOR))
                                 if original_row['Needs Highlighting']:
                                     dynamic_styles.append(
-                                        ('BACKGROUND', (5, i), (6, i), colors.yellow))
+                                        ('BACKGROUND', (5, i), (6, i), MULTI_PICK_COLOR))
                             except (IndexError, AttributeError):
                                 pass
 
@@ -558,30 +608,30 @@ if uploaded_file is not None and location_map_file is not None:
             st.warning(
                 "No valid first-priority items were found based on the provided files.")
 
-        '''# --- NEW: Debugging Section ---
-        st.markdown("---")
-        st.header("Debug Information (Intermediate Steps)")
+        # # --- NEW: Debugging Section ---
+        # st.markdown("---")
+        # st.header("Debug Information (Intermediate Steps)")
 
-        with st.expander("Step 1: Raw Data After Filtering"):
-            st.caption(
-                "This shows the rows from the production ticket that matched a valid location in your mapping file. Rows with (WIP) or (NC) are excluded.")
-            if '1_filtered_ticket' in debug_dfs and not debug_dfs['1_filtered_ticket'].empty:
-                st.dataframe(debug_dfs['1_filtered_ticket'])
+        # with st.expander("Step 1: Raw Data After Filtering"):
+        #     st.caption(
+        #         "This shows the rows from the production ticket that matched a valid location in your mapping file. Rows with (WIP) or (NC) are excluded.")
+        #     if '1_filtered_ticket' in debug_dfs and not debug_dfs['1_filtered_ticket'].empty:
+        #         st.dataframe(debug_dfs['1_filtered_ticket'])
 
-        with st.expander("Step 2: After Classification"):
-            st.caption("This is the MOST IMPORTANT step. Check the 'Location Type' and 'Location Priority' columns. A lower priority number is better. Ensure Powder/Allergen locations are correctly typed and prioritized.")
-            if '2_classified_data' in debug_dfs and not debug_dfs['2_classified_data'].empty:
-                st.dataframe(debug_dfs['2_classified_data'])
+        # with st.expander("Step 2: After Classification"):
+        #     st.caption("This is the MOST IMPORTANT step. Check the 'Location Type' and 'Location Priority' columns. A lower priority number is better. Ensure Powder/Allergen locations are correctly typed and prioritized.")
+        #     if '2_classified_data' in debug_dfs and not debug_dfs['2_classified_data'].empty:
+        #         st.dataframe(debug_dfs['2_classified_data'])
 
-        with st.expander("Step 3: After Sorting by Priority"):
-            st.caption("This shows the full list of all possible items, sorted by Component, then by the 'Location Priority'. The top items for each component will be picked first.")
-            if '3_sorted_by_priority' in debug_dfs and not debug_dfs['3_sorted_by_priority'].empty:
-                st.dataframe(debug_dfs['3_sorted_by_priority'])
+        # with st.expander("Step 3: After Sorting by Priority"):
+        #     st.caption("This shows the full list of all possible items, sorted by Component, then by the 'Location Priority'. The top items for each component will be picked first.")
+        #     if '3_sorted_by_priority' in debug_dfs and not debug_dfs['3_sorted_by_priority'].empty:
+        #         st.dataframe(debug_dfs['3_sorted_by_priority'])
 
-        with st.expander("Step 4: After Final Priority Assignment"):
-            st.caption("This is the final result before formatting. Check the 'Assigned Priority' column to see which items were selected for 'First Priority' based on the quantity needed.")
-            if '4_final_assignments' in debug_dfs and not debug_dfs['4_final_assignments'].empty:
-                st.dataframe(debug_dfs['4_final_assignments'])'''
+        # with st.expander("Step 4: After Final Priority Assignment"):
+        #     st.caption("This is the final result before formatting. Check the 'Assigned Priority' column to see which items were selected for 'First Priority' based on the quantity needed.")
+        #     if '4_final_assignments' in debug_dfs and not debug_dfs['4_final_assignments'].empty:
+        #         st.dataframe(debug_dfs['4_final_assignments'])
 
     except Exception as e:
         st.error(f"An error occurred: {e}")
