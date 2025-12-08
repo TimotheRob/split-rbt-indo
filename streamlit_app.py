@@ -299,7 +299,7 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
         info_copy = {k: v for k, v in product_info.items() if k !=
                      "Production Ticket Nr"}
         if 'Quantity Produced' in info_copy:
-            info_copy['Quantity Produced'] = f"{info_copy['Quantity Produced']:.4f}"
+            info_copy['Quantity Produced'] = f"{info_copy['Quantity Produced']:.3f}"
 
         info_data = []
         for key, value in info_copy.items():
