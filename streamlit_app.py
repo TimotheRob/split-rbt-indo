@@ -18,7 +18,7 @@ from reportlab.lib.enums import TA_LEFT
 # --- GLOBAL CONSTANTS & CONFIGURATION ---
 # ==========================================
 # Set this to True to see intermediate data tables in the app. Set to False to hide them.
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 LOCATION_ORDER = ["Heat", "Cold Room", "Powder",
                   "Tower", "Pour drum", "Production", "Warehouse"]
