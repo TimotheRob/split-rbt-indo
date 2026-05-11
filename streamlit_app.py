@@ -54,7 +54,7 @@ def preprocess_location_map(uploaded_map_file):
 
     df_map.drop_duplicates(subset=['Code'], keep='first', inplace=True)
     df_map = df_map[~df_map['Name'].str.contains(
-        '(WIP|NC)', case=False, na=False)]
+        r'\(WIP\)|\(NC\)', regex=True, case=False, na=False)]
 
     def get_location_attributes(row):
         code = str(row['Code'])
@@ -113,6 +113,7 @@ def classify_location(base_type, qty_required, max_tower_qty, max_pour_drum_qty)
 
 
 def format_output_df(df_priority):
+    """Formats a DataFrame for PDF export, fixing mixed types for Streamlit Arrow."""
     if df_priority.empty:
         return pd.DataFrame(columns=["Location", "Location Description", "RM name", "RM code", "Batch number",
                                      "Available Quantity", "Quantity required", "Expiry Status", "Needs Highlighting",
@@ -132,8 +133,9 @@ def format_output_df(df_priority):
     # Process 'Unknown' items FIRST
     unknown_subset = df_final[df_final["Location"] == "Unknown"]
     if not unknown_subset.empty:
+        # --- FIXED: Use None instead of "" for numeric columns to prevent Arrow error ---
         header_row = {"Location": "TBProd. / Loc.", "Location Description": "", "RM name": "", "RM code": "",
-                      "Batch number": "", "Available Quantity": "", "Quantity required": "",
+                      "Batch number": "", "Available Quantity": None, "Quantity required": None,
                       "Expiry Status": "", "Needs Highlighting": False, "Is Allergen": False,
                       "Location Priority": 99, "Is To Be Produced": True}
         formatted_rows.append(header_row)
@@ -149,8 +151,10 @@ def format_output_df(df_priority):
     for location in LOCATION_ORDER:
         subset = df_final[df_final["Location"] == location]
         if not subset.empty:
-            header_row = {"Location": location, "Location Description": "", "RM name": "", "RM code": "", "Batch number": "", "Available Quantity": "",
-                          "Quantity required": "", "Expiry Status": "", "Needs Highlighting": False, "Is Allergen": False,
+            # --- FIXED: Use None instead of "" for numeric columns to prevent Arrow error ---
+            header_row = {"Location": location, "Location Description": "", "RM name": "", "RM code": "",
+                          "Batch number": "", "Available Quantity": None, "Quantity required": None,
+                          "Expiry Status": "", "Needs Highlighting": False, "Is Allergen": False,
                           "Location Priority": 0, "Is To Be Produced": False}
             formatted_rows.append(header_row)
 
@@ -168,7 +172,8 @@ def format_output_df(df_priority):
     if not formatted_rows:
         return pd.DataFrame(columns=df_final.columns)
 
-    return pd.DataFrame(formatted_rows)
+    df_output = pd.DataFrame(formatted_rows)
+    return df_output
 
 
 def process_data(df, location_map, max_tower_qty, max_pour_drum_qty):
@@ -368,7 +373,9 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
         styles['Normal'].fontName = FONT_NORMAL
         styles['h1'].fontName = FONT_BOLD
 
-        elements, is_first_content_block, content_added_to_this_pdf = [], True, False
+        elements = []
+        is_first_content_block = True
+        content_added_to_this_pdf = False
 
         title_text = f"Production Ticket Information - {product_info['Production Ticket Nr']}"
         if total_files > 1:
@@ -378,26 +385,79 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
 
         info_copy = {k: v for k, v in product_info.items() if k !=
                      "Production Ticket Nr"}
+
+        # --- NEW: Check for Quantity Shortage ---
+        is_qty_shortage = False
+        try:
+            qty_launched = float(info_copy.get('Quantity Launched', 0))
+            qty_produced = float(info_copy.get('Quantity Produced', 0))
+            # Round to 3 decimal places to avoid microscopic float precision errors
+            if round(qty_produced, 3) < round(qty_launched, 3):
+                is_qty_shortage = True
+        except (ValueError, TypeError):
+            pass
+
+        # Format the Quantity Produced to 3 decimal places
         if 'Quantity Produced' in info_copy:
             info_copy['Quantity Produced'] = f"{info_copy['Quantity Produced']:.3f}"
 
         info_data = []
-        for key, value in info_copy.items():
+        qty_produced_row_index = -1
+
+        for i, (key, value) in enumerate(info_copy.items()):
+            if key == 'Quantity Produced':
+                qty_produced_row_index = i
+
             if key == 'Wording':
                 info_data.append(
                     [key, Paragraph(str(value), styles['Normal'])])
             else:
                 info_data.append([key, str(value)])
 
-        info_table = Table(info_data, colWidths=[1.5*inch, 2.5*inch])
-        info_table.setStyle(TableStyle([('ALIGN', (0, 0), (-1, -1), 'LEFT'), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('FONTNAME', (0, 0), (0, -1), FONT_BOLD), ('FONTNAME',
-                            (1, 0), (1, -1), FONT_NORMAL), ('GRID', (0, 0), (-1, -1), 1, colors.black), ('BOTTOMPADDING', (0, 0), (-1, -1), 6), ('TOPPADDING', (0, 0), (-1, -1), 6)]))
+        info_table_style = [
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('FONTNAME', (0, 0), (0, -1), FONT_BOLD),
+            ('FONTNAME', (1, 0), (1, -1), FONT_NORMAL),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6)
+        ]
 
-        legend_data = [['Color', 'Meaning'], ['', 'Allergen Material'], ['', 'Expired Material'], ['', 'Expires Within 1 Month'], [
-            '', 'Multi-location Pick'], ['', 'To Be Produced / Located'], ['Red text', 'Qty < 0.001 (Check Online)']]
+        # --- NEW: Apply red background to the cell if there is a shortage ---
+        if is_qty_shortage and qty_produced_row_index != -1:
+            info_table_style.append(
+                ('BACKGROUND', (1, qty_produced_row_index), (1, qty_produced_row_index), colors.lightcoral))
+
+        info_table = Table(info_data, colWidths=[1.5*inch, 2.5*inch])
+        info_table.setStyle(TableStyle(info_table_style))
+
+        legend_data = [
+            ['Color', 'Meaning'],
+            ['', 'Allergen Material'],
+            ['', 'Expired Material'],
+            ['', 'Expires Within 1 Month'],
+            ['', 'Multi-location Pick'],
+            ['', 'To Be Produced / Located'],
+            ['RED TEXT', 'Qty < 0.001 (Check Online)']
+        ]
+
         legend_table = Table(legend_data, colWidths=[0.7*inch, 2.2*inch])
-        legend_table.setStyle(TableStyle([('FONTNAME', (0, 0), (-1, 0), FONT_BOLD), ('GRID', (0, 0), (-1, -1), 1, colors.black), ('ALIGN', (0, 0), (-1, -1), 'LEFT'), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('BOTTOMPADDING', (0, 0), (-1, -1), 4), ('TOPPADDING', (0, 0), (-1, -1), 4), ('BACKGROUND', (0, 1), (0, 1),
-                              ALLERGEN_COLOR), ('BACKGROUND', (0, 2), (0, 2), EXPIRED_COLOR), ('BACKGROUND', (0, 3), (0, 3), EXPIRING_SOON_COLOR), ('BACKGROUND', (0, 4), (0, 4), MULTI_PICK_COLOR), ('BACKGROUND', (0, 5), (0, 5), TO_BE_PRODUCED_COLOR), ('TEXTCOLOR', (0, 6), (0, 6), ZERO_QTY_COLOR), ('FONTNAME', (0, 6), (0, 6), FONT_BOLD)]))
+        legend_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, 0), FONT_BOLD), ('GRID',
+                                                       (0, 0), (-1, -1), 1, colors.black),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'), ('VALIGN',
+                                                  (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1),
+             4), ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BACKGROUND', (0, 1), (0, 1), ALLERGEN_COLOR), ('BACKGROUND',
+                                                             (0, 2), (0, 2), EXPIRED_COLOR),
+            ('BACKGROUND', (0, 3), (0, 3), EXPIRING_SOON_COLOR), ('BACKGROUND',
+                                                                  (0, 4), (0, 4), MULTI_PICK_COLOR),
+            ('BACKGROUND', (0, 5), (0, 5), TO_BE_PRODUCED_COLOR),
+            ('TEXTCOLOR', (0, 6), (0, 6),
+             ZERO_QTY_COLOR), ('FONTNAME', (0, 6), (0, 6), FONT_BOLD)
+        ]))
 
         parent_table = Table([[info_table, legend_table]], colWidths=[
                              4.2*inch, 2.9*inch], style=[('VALIGN', (0, 0), (-1, -1), 'TOP')])
@@ -407,6 +467,7 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
         for priority_name in content_to_include:
             if priority_name in priority_dfs:
                 df_to_filter = priority_dfs[priority_name]
+                # Filter specifically matches the string abbreviation we set in format_output_df
                 df_output = df_to_filter[df_to_filter['Location'].isin(
                     locations_for_this_file) | (df_to_filter['Location'] == 'TBProd. / Loc.')]
 
@@ -425,8 +486,11 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
 
                     for _, row in df_output.iterrows():
                         if row['RM code'] == '':
-                            table_data.append(list(row.drop(
-                                ['Expiry Status', 'Needs Highlighting', 'Is Allergen', 'Is To Be Produced', 'Location Priority'])))
+                            header_data = list(row.drop(
+                                ['Expiry Status', 'Needs Highlighting', 'Is Allergen', 'Is To Be Produced', 'Location Priority']))
+                            header_data = ["" if pd.isna(
+                                x) else x for x in header_data]
+                            table_data.append(header_data)
                             continue
 
                         is_zero_qty = False
@@ -452,8 +516,14 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
                         else:
                             barcode_cell = barcode_p
 
-                        table_data.append([row['Location'], Paragraph(str(row['Location Description']), p_style_norm), Paragraph(str(
-                            row['RM name']), p_style_left), barcode_cell, Paragraph(str(row['Batch number']), p_style_norm), row['Available Quantity'], row['Quantity required']])
+                        table_data.append([
+                            row['Location'], Paragraph(
+                                str(row['Location Description']), p_style_norm),
+                            Paragraph(str(row['RM name']),
+                                      p_style_left), barcode_cell,
+                            Paragraph(str(
+                                row['Batch number']), p_style_norm), row['Available Quantity'], row['Quantity required']
+                        ])
 
                     output_table = Table(table_data, colWidths=[
                                          0.8*inch, 1*inch, 2*inch, 1*inch, 1*inch, 0.8*inch, 0.8*inch], repeatRows=1)
@@ -469,9 +539,11 @@ def generate_pdf(product_info, priority_dfs, barcode_locations, file_configs, co
                             try:
                                 original_row = df_output[df_output['Batch number'] == str(
                                     row_data[4].text)].iloc[0]
+
                                 if float(original_row['Quantity required']) == 0.0:
                                     dynamic_styles.append(
                                         ('TEXTCOLOR', (0, i), (-1, i), ZERO_QTY_COLOR))
+
                                 if original_row['Is To Be Produced']:
                                     dynamic_styles.append(
                                         ('BACKGROUND', (0, i), (-1, i), TO_BE_PRODUCED_COLOR))
